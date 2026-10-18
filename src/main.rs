@@ -1,4 +1,8 @@
-use crate::States::{Candidate, Follower, Leader};
+mod kv;
+use crate::{
+    States::{Candidate, Follower, Leader},
+    kv::{Entry, command_recieve, commands},
+};
 use anyhow::Result;
 use rand::prelude::*;
 use std::{
@@ -21,11 +25,12 @@ enum States {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let values = Arc::new(Mutex::new(Vec::<Entry>::new()));
     let state = Arc::new(Mutex::new(Follower));
     let time = Arc::new(Mutex::new(Instant::now()));
     let term = Arc::new(Mutex::new(0));
     let vote_elegible = Arc::new(Mutex::new(true));
-    let votes = Arc::new(Mutex::new((0i32, 0usize))); 
+    let votes = Arc::new(Mutex::new((0i32, 0usize)));
 
     let configuration: String = match fs::read_to_string("peers.conf").await {
         Ok(stuff) => stuff,
@@ -50,6 +55,16 @@ async fn main() -> Result<()> {
     };
 
     {
+        let (ip, all_ip) = (listen_ip.clone(), config_ips.clone());
+        tokio::spawn(async move {
+            if let Err(e) = commands(ip, all_ip).await {
+                eprintln!("failed to get input: {}", e);
+                std::process::exit(1);
+            };
+        });
+    }
+
+    {
         let (
             all_address,
             ip_address,
@@ -67,7 +82,7 @@ async fn main() -> Result<()> {
             vote_elegible.clone(),
             votes.clone(),
         );
-
+        let values_clone = values.clone();
         tokio::spawn(async move {
             let (state, time, term, vote_elegible, votes) = (
                 Arc::clone(&state_clone),
@@ -76,6 +91,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&vote_elegible_clone),
                 Arc::clone(&votes_clone),
             );
+            let value = Arc::clone(&values_clone);
             loop {
                 if *state.lock().unwrap() == Leader {
                     sleep(Duration::from_millis(50)).await;
@@ -94,9 +110,9 @@ async fn main() -> Result<()> {
                             let mut current_term = term.lock().unwrap();
                             *current_state = Candidate;
                             *current_term += 1;
-                            *votes.lock().unwrap() = (*current_term, 1); 
-                            *vote_eleg = false; 
-                            *time.lock().unwrap() = Instant::now(); 
+                            *votes.lock().unwrap() = (*current_term, 1);
+                            *vote_eleg = false;
+                            *time.lock().unwrap() = Instant::now();
 
                             let majority = (all_address.len() / 2) + 1;
                             if 1 >= majority {
@@ -111,11 +127,22 @@ async fn main() -> Result<()> {
 
                         let to_send = {
                             let current_term = term.lock().unwrap();
-                            format!("VOTE_REQUEST {}", *current_term)
+                            let (last_index, last_term) = {
+                                let vals = value.lock().unwrap();
+                                match vals.last() {
+                                    Some(e) => (e.index, e.term),
+                                    None => (0, 0),
+                                }
+                            };
+
+                            format!(
+                                "VOTE_REQUEST {} {} {}",
+                                *current_term, last_term, last_index
+                            )
                         };
 
                         if let Err(e) =
-                            sender(&to_send, ip_address.clone(), all_address.clone()).await
+                            sender(&to_send, ip_address.clone(), all_address.clone(), false).await
                         {
                             eprintln!("failed to send a vote request: {}", e);
                         };
@@ -128,26 +155,25 @@ async fn main() -> Result<()> {
     {
         let all_address = config_ips.clone();
         let ip_address = listen_ip.clone();
-        tokio::spawn(async move {
-            loop {
-                let mut val = String::new();
-                std::io::stdin().read_line(&mut val).unwrap();
-                sender(&val, ip_address.clone(), all_address.clone())
-                    .await
-                    .unwrap();
-            }
-        });
-    }
-
-    {
-        let all_address = config_ips.clone();
-        let ip_address = listen_ip.clone();
         let state_clone = state.clone();
+
+        let term_clone = term.clone();
         tokio::spawn(async move {
             let state = Arc::clone(&state_clone);
+            let term = Arc::clone(&term_clone);
             loop {
                 if *state.lock().unwrap() == Leader {
-                    if let Err(e) = sender("BEAT", ip_address.clone(), all_address.clone()).await {
+                    let beat_term = *term.lock().unwrap();
+                    let beat_message = format!("BEAT {}", beat_term);
+
+                    if let Err(e) = sender(
+                        &beat_message,
+                        ip_address.clone(),
+                        all_address.clone(),
+                        false,
+                    )
+                    .await
+                    {
                         eprintln!("failed to send BEAT: {e}");
                     };
                 }
@@ -169,13 +195,15 @@ async fn main() -> Result<()> {
                 let term_clone = term.clone();
                 let vote_clone = vote_elegible.clone();
                 let votes_clone = votes.clone();
+                let values_clone = values.clone();
                 tokio::spawn(async move {
-                    let (time, state, term, vote_elegible, votes) = (
+                    let (time, state, term, vote_elegible, votes, value) = (
                         Arc::clone(&clone_time),
                         Arc::clone(&clone_state),
                         Arc::clone(&term_clone),
                         Arc::clone(&vote_clone),
                         Arc::clone(&votes_clone),
+                        Arc::clone(&values_clone),
                     );
                     let mut reader = BufReader::new(stream);
                     let mut buffer = Vec::new();
@@ -195,10 +223,76 @@ async fn main() -> Result<()> {
                     if is_leader == false {
                         if body.contains("BEAT") {
                             {
-                                let mut current_time = time.lock().unwrap();
-                                *current_time = Instant::now(); 
-                                
+                                let their_term: i32 = body
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .and_then(|t| t.parse().ok())
+                                    .unwrap_or(0);
+
+                                let current_term = term.lock().unwrap();
+
+                                if their_term < *current_term {
+                                    return;
+                                }
                             }
+
+                            {
+                                let mut current_time = time.lock().unwrap();
+                                let mut current_state = state.lock().unwrap();
+                                *current_state = Follower;
+                                *current_time = Instant::now();
+                            }
+                        }
+                    }
+
+                    if body.starts_with("PULL_RESULT") {
+                        let result_parts: Vec<&str> = body.splitn(3, ' ').collect();
+                        if result_parts.len() == 3 {
+                            println!("{} = {}", result_parts[1], result_parts[2]);
+                        }
+                        return;
+                    }
+
+                    if (body.contains("PUSH") || body.contains("PULL")) && body.contains("KVQUEST")
+                    {
+                        if is_leader == false {
+                            eprintln!("rejected '{}': this node is not the leader", body);
+                            return;
+                        }
+
+                        let current_term = { *term.lock().unwrap() as i64 };
+
+                        if let Err(e) = command_recieve(
+                            body,
+                            &value,
+                            current_term,
+                            &ip_address,
+                            sender_addr,
+                            all_address.clone(),
+                        )
+                        .await
+                        {
+                            eprintln!("failed to send command: {}", e);
+                            return;
+                        }
+                    }
+
+                    if (body.contains("PUSH") || body.contains("PULL")) && !body.contains("KVQUEST")
+                    {
+                        let current_term = { *term.lock().unwrap() as i64 };
+
+                        if let Err(e) = command_recieve(
+                            body,
+                            &value,
+                            current_term,
+                            &ip_address,
+                            sender_addr,
+                            all_address.clone(),
+                        )
+                        .await
+                        {
+                            eprintln!("failed to send command: {}", e);
+                            return;
                         }
                     }
 
@@ -220,12 +314,43 @@ async fn main() -> Result<()> {
                                 *current_state = Follower;
                             }
 
+                            if their_term < *current_term {
+                                return;
+                            }
+                            {
+                                let their_last_term: i64 = body
+                                    .split_whitespace()
+                                    .nth(2)
+                                    .and_then(|t| t.parse().ok())
+                                    .unwrap_or(0);
+                                let their_last_index: i64 = body
+                                    .split_whitespace()
+                                    .nth(3)
+                                    .and_then(|t| t.parse().ok())
+                                    .unwrap_or(0);
+
+                                let (last_index, last_term) = {
+                                    let vals = value.lock().unwrap();
+                                    match vals.last() {
+                                        Some(e) => (e.index, e.term),
+                                        None => (0, 0),
+                                    }
+                                };
+                                let candidate_is_up_to_date = their_last_term > last_term
+                                    || (their_last_term == last_term
+                                        && their_last_index >= last_index);
+
+                                if !candidate_is_up_to_date {
+                                    return;
+                                }
+                            }
+
                             their_term >= *current_term && *vote_eleg
                         };
 
                         if can_vote {
                             *vote_elegible.lock().unwrap() = false;
-                            *time.lock().unwrap() = Instant::now(); 
+                            *time.lock().unwrap() = Instant::now();
                             let voted_term = *term.lock().unwrap();
                             let message = format!("{}> VOTED {}", ip_address.clone(), voted_term);
                             let mut stream = match TcpStream::connect(sender_addr).await {
@@ -284,16 +409,17 @@ async fn find_listener(ips: Vec<String>) -> Option<String> {
     None
 }
 
-async fn sender(message: &str, my_ip: String, ips: Vec<String>) -> Result<()> {
+async fn sender(message: &str, my_ip: String, ips: Vec<String>, include_self: bool) -> Result<()> {
     let message = format!("{}> {}", my_ip, message);
     for ip in ips {
-        if ip != my_ip {
-            let mut stream = match TcpStream::connect(ip).await {
-                Ok(ip) => ip,
-                Err(_) => continue,
-            };
-            stream.write_all(message.as_bytes()).await?;
+        if ip == my_ip && !include_self {
+            continue;
         }
+        let mut stream = match TcpStream::connect(ip).await {
+            Ok(ip) => ip,
+            Err(_) => continue,
+        };
+        stream.write_all(message.as_bytes()).await?;
     }
     Ok(())
 }
